@@ -1,0 +1,457 @@
+import json
+import hmac
+import hashlib
+import base64
+import logging
+import requests
+import boto3
+import os
+import random
+import string
+from requests.auth import HTTPBasicAuth
+from botocore.exceptions import ClientError
+
+# AWS SSM client
+ssm = boto3.client('ssm')
+
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Define constants
+TERMINALS = {
+    "USA": {
+        "ecommerce": {"terminal_id": "0017340008025557375191", "application_id": "TZ9999IC"},
+        "moto": {"terminal_id": "00173400080257391040", "application_id": "TZ9999MC"},
+        "currency": "USD"
+    },
+    "CAN": {
+        "ecommerce": {"terminal_id": "0089250008025557433284", "application_id": "TZ9999IC"},
+        "moto": {"terminal_id": "0089250008025557441121", "application_id": "TZ9999MC"},
+        "currency": "CAD"
+    }
+}
+AGENCIES = {"Flair Air", "Air Black Box"}
+ 
+# Initialize DynamoDB client
+dynamodb = boto3.resource('dynamodb')
+
+# DynamoDB table reference for tracking used authorization codes
+auth_table = dynamodb.Table('AuthCodesTable')
+ 
+def determine_terminal_app_id(agency, country):
+    # Determine type based on agency
+    transaction_type = "ecommerce" if agency in AGENCIES else "moto"
+    
+    # Select terminal, application ID, and currency
+    terminal_data = TERMINALS.get(country)
+    if not terminal_data:
+        raise ValueError(f"Country {country} not supported")
+    
+    terminal_id = terminal_data[transaction_type]["terminal_id"]
+    application_id = terminal_data[transaction_type]["application_id"]
+    currency = terminal_data["currency"]
+    
+    return terminal_id, application_id, currency, transaction_type
+
+def generate_unique_auth_code():
+    # Define allowed characters: uppercase letters and digits
+    allowed_chars = string.ascii_uppercase + string.digits
+    while True:
+        # Generate a random 6-character code
+        auth_code = ''.join(random.choices(allowed_chars, k=6))
+        
+        # Check DynamoDB to ensure uniqueness
+        try:
+            response = auth_table.get_item(Key={'authorization_code': auth_code})
+            if 'Item' not in response:
+                # If the code is not found in DynamoDB, store it and return
+                auth_table.put_item(Item={'authorization_code': auth_code})
+                return auth_code
+        except ClientError as e:
+            print(f"Error accessing DynamoDB: {e}")
+            return None
+ 
+def store_transaction(pnr, agency, country, terminal_id, application_id, currency, transaction_type):
+    try:
+        # Use the 'Table' object to put items into DynamoDB
+        table = dynamodb.Table('PaymentGateway_Orchestrator_Terminal_Data')
+        table.put_item(
+            Item={
+                'PNR': pnr,
+                'AgencyName': agency,
+                'Country': country,
+                'TerminalID': terminal_id,
+                'ApplicationID': application_id,
+                'Currency': currency,
+                'TransactionType': transaction_type
+            }
+        )
+    except ClientError as e:
+        print(f"Error storing transaction data: {e}")
+        return False
+    return True
+
+# Set up a counter table in DynamoDB to track attempts per transaction
+dynamodb = boto3.resource('dynamodb')
+table = dynamodb.Table('3DSAttemptsTable')
+
+# Environment variables for the registration key, host, and other configurations
+REGISTRATION_KEY = os.environ.get('REGISTRATION_KEY')
+HOST = "certgate.viaconex.com"
+ENDPOINT = "/cgi-bin/encompass4.cgi"
+VERSION = "4079"  # Current version according to the documentation
+
+def get_parameter(param_name):
+    ssm = boto3.client('ssm')
+    response = ssm.get_parameter(Name=param_name, WithDecryption=True)
+    return response['Parameter']['Value']
+    
+def get_auth_token_from_parameter_store():
+    """Retrieve JWT token from AWS Parameter Store"""
+    try:
+        response = ssm.get_parameter(
+            Name='/jwt/token/dev/Vikram',
+            WithDecryption=True  # Decrypt if stored encrypted
+        )
+        return response['Parameter']['Value']
+    except ClientError as e:
+        logger.error(f"Error retrieving token from SSM: {e}")
+        return None
+
+# def send_to_3ds_api(auth_token):
+#     api_key = '/3ds/api-key'
+#     response = ssm.get_parameter(Name=api_key, WithDecryption=True)
+#     threeds_api_key = response['Parameter']['Value']
+#     # Retrieve API key from Parameter Store
+    
+#     token = '/3ds/Bearer-token'
+#     response = ssm.get_parameter(Name=token, WithDecryption=True)
+#     Bearer_token = response['Parameter']['Value']
+    
+#     print(threeds_api_key, Bearer_token)
+#     """Send request to 3DS API"""
+#     three_ds_api_url = "https://api-sandbox.3dsintegrator.com/v2.2/authenticate/browser"
+#     three_ds_api_headers = {
+#         "Accept": "application/json",
+#         "Content-Type": "application/json",
+#         "X-3DS-API-KEY": threeds_api_key,
+#         "Authorization": f"Bearer {Bearer_token}"
+#     }
+#     three_ds_api_data = {
+#         "browser": {
+#             "browserAcceptHeader": "application/json",
+#             "browserLanguage": "en-US",
+#             "browserUserAgent": "Mozilla/5.0..."
+#         },
+#         "challengeIndicator": "01",
+#         "amount": 150.25,
+#         "month": "08",
+#         "year": "22",
+#         "pan": "4005519200000004",
+#         "threeDSRequestorURL": "https://flyflair.com"
+#     }
+#     three_ds_api_response = requests.post(
+#         three_ds_api_url,
+#         headers=three_ds_api_headers,
+#         data=json.dumps(three_ds_api_data)
+#     )
+#     three_ds_api_response.raise_for_status()
+#     three_ds_api_response_json = three_ds_api_response.json()
+#     logger.info(f"3DS API Response: {three_ds_api_response.json()}")
+#     #return three_ds_api_response.json()
+#     return three_ds_api_response_json
+#     #{
+    #'statusCode': 200,
+    #'body': json.dumps({'message': 'Sent to 3DS API', 'threeDsResponse': str(three_ds_api_response_json)})
+    #}
+
+
+def send_to_elavon_api(auth_token, transaction_id, card_data, transaction_amount, zip_code, street_address):
+    transaction_id = transaction_id
+    card_data = card_data
+    transaction_amount = transaction_amount
+    zip_code = zip_code
+    street_address = street_address
+
+    print(card_data, transaction_amount, zip_code)
+    
+    # Retrieve or initialize the attempt count
+    attempt_count = get_attempt_count(transaction_id)
+    
+    # If the count exceeds 4, decline the transaction
+    if attempt_count >= 150:
+        return {"status": "DECLINED", "message": "Transaction declined after too many attempts"}
+    
+    # Increment attempt count
+    increment_attempt_count(transaction_id)
+
+    # Set up headers and payload
+    headers = {
+        "Host": HOST,
+        "Registration-Key": REGISTRATION_KEY,
+        "Content-Type": "application/xml",
+        "Connection": "Keep-Alive"
+    }
+    
+    # XML payload structure based on the documentation
+    payload = f"""<?xml version="1.0" encoding="ISO-8859-1"?>
+    <Request id="Credit Card.Sale">
+        <Version>4079</Version>
+        <Block id="HD">
+            <Application_ID>TZ9999IC</Application_ID>
+            <Terminal_ID>0089250008025557433284</Terminal_ID>
+      
+        </Block>
+        <Block id="01"> 
+            <POS_Entry_Capability>1</POS_Entry_Capability>      
+            <Account_Entry_Mode>01</Account_Entry_Mode>
+            <Partial_Auth_Indicator>0</Partial_Auth_Indicator>
+            <Account_Data>{card_data}</Account_Data>
+            <Transaction_Amount>{transaction_amount}</Transaction_Amount>
+            <Last_Record_Number>0000</Last_Record_Number>
+        </Block>
+        <Block id="10">
+            <CVV2_Indicator>0</CVV2_Indicator>
+            <Postal_ZIP_Code>{zip_code}</Postal_ZIP_Code>
+        </Block>
+    </Request>"""
+
+    print(payload)
+    # Send POST request
+    url = f"https://{HOST}{ENDPOINT}"
+    response = requests.post(url, headers=headers, data=payload)
+    print(response)
+    # Parse response
+    if response.status_code == 200:
+        response_data = response.text
+        return {"status": "APPROVED", "response": response_data}
+    else:
+        return {"status": "ERROR", "message": "Transaction failed", "details": response.text}
+
+# Helper function to retrieve attempt count from DynamoDB
+def get_attempt_count(transaction_id):
+    try:
+        response = table.get_item(Key={'transaction_id': transaction_id})
+        if 'Item' in response:
+            return response['Item'].get('attempt_count', 0)
+        return 0
+    except ClientError as e:
+        print(f"Error retrieving attempt count: {e}")
+        return 0
+
+# Helper function to increment attempt count in DynamoDB
+def increment_attempt_count(transaction_id):
+    try:
+        table.update_item(
+            Key={'transaction_id': transaction_id},
+            UpdateExpression="SET attempt_count = if_not_exists(attempt_count, :start) + :inc",
+            ExpressionAttributeValues={':inc': 1, ':start': 0}
+        )
+    except ClientError as e:
+        print(f"Error incrementing attempt count: {e}")
+
+
+def lambda_handler(event, context):
+    try:
+        # Retrieve x-user-id from Parameter Store
+        param_name_x_user_id = '/myapi/user_id'
+        response = ssm.get_parameter(Name=param_name_x_user_id, WithDecryption=True)
+        uid = response['Parameter']['Value']
+        
+        # Retrieve API key from Parameter Store
+        param_name_api_key = '/myapi/api_key'
+        response = ssm.get_parameter(Name=param_name_api_key, WithDecryption=True)
+        key_param = response['Parameter']['Value']
+        key = key_param.encode('utf-8')
+        
+        # Convert uid to bytes
+        uid_bytes = uid.encode('utf-8')
+        
+        
+        # Extract the token reference
+        token = event['token']
+        
+        # Print the token reference
+        pnr = token.split('-')[1]
+        print("PNR------>", pnr) # This will print K6RUNH
+        
+        base_url = 'https://flairair-api.intelisystraining.ca/RESTv1/reservations'
+        url = '{}?reservationLocator={}'.format(base_url, pnr)
+        
+        parameter_username = '/flyflair/prod/username'
+        parameter_password = '/flyflair/prod/password'
+        
+        # Retrieve username and password from Parameter Store
+        username = get_parameter(parameter_username)
+        password = get_parameter(parameter_password)
+        
+        response = requests.get(url, auth=HTTPBasicAuth(username, password))
+        response.raise_for_status()  # Raise an exception for 4xx or 5xx status codes
+        passenger_data = response.json()
+        print("passenger_data------>", passenger_data)
+        
+        agency_name = passenger_data[0]["bookingInformation"]["agency"]["name"]
+        print("agency_name------>", agency_name)
+        
+        currency_code = passenger_data[0]["bookingInformation"]["currency"]["code"]
+        print("currency_code------>", currency_code)
+        
+        reservation_key = passenger_data[0]["key"]
+        print("reservation_key------>", reservation_key)
+
+        reservationapi = f'https://flairair-api.intelisystraining.ca/RESTv1/reservations/{reservation_key}'
+        response = requests.get(reservationapi, auth=HTTPBasicAuth(username, password))
+        
+        country_data = response.json()
+        print("country_data------>", country_data)
+        
+        country_name = country_data["passengers"][0]["advancePassengerInformation"]["destinationAddress"]["location"]["country"]
+        print("country_name------>", country_name)
+
+        country_name = "USA" # hard coded (need change)
+        
+        # Generate a unique authorization code for this transaction
+        auth_code = generate_unique_auth_code()
+        print("auth_code------>", auth_code)
+        if auth_code is None:
+            return {'statusCode': 500, 'body': 'Error generating authorization code'}
+        
+        # Include the generated code in the response or transaction processing
+        
+        # Retrieve the authorization token from Parameter Store
+        auth_token = get_auth_token_from_parameter_store()
+        print("auth_token------>", auth_token)
+        if not auth_token:
+            return {
+                'statusCode': 500,
+                'body': json.dumps({'error': 'Unable to retrieve authorization token'})
+            }
+
+        # Parse JSON from the event
+        body_json = json.loads(json.dumps(event))
+        card_details = body_json
+        card = body_json.get('card_data', "")
+        expiry_month = str(body_json.get('expiry_month', ""))
+        expiry_year = str(body_json.get('expiry_year', ""))
+        expiry_date = f"{expiry_month}{expiry_year[-2:]}"
+        card_data = f"{str(card)}={str(expiry_date)}"
+        agency = agency_name
+        currency = currency_code
+        country = country_name
+   
+        # Extract the last four digits of the card number
+        last_four_digits = str(card)[-4:]
+        
+        name_on_card = card_details.get("name_on_card", "")
+        name = body_json.get('first_name', "")
+        transaction_id = body_json.get("transaction_id", "")
+        transaction_amount = body_json['payment'].get("amount", 0)
+        zip_code = card_details.get("postal_code", "V5M2R6")
+        street_address = card_details.get("address", "")
+        print("card_data------>", card_data)
+        
+        
+        if not pnr or not country or not agency:
+            return {"statusCode": 400, "body": "PNR, country, and agency are required"}
+ 
+        # Determine terminal, application ID, and currency
+        try:
+            terminal_id, application_id, currency_code, transaction_type = determine_terminal_app_id(agency, country)
+            print("terminal_id, application_id, currency_code, transaction_type------>", terminal_id, application_id, currency_code, transaction_type)
+        except ValueError as e:
+            return {"statusCode": 400, "body": str(e)}
+        
+        # Store transaction details in DynamoDB
+        success = store_transaction(pnr, agency, country, terminal_id, application_id, currency, transaction_type)
+        if not success:
+            return {"statusCode": 500, "body": "Error storing transaction data"}
+
+        # Construct the elavon response
+        elavon_responses = {
+            "transaction_id": transaction_id,
+            "terminal_id": terminal_id,
+            "application_id": application_id,
+            "currency": currency_code,
+            "agency": agency_name,
+            "transaction_type": transaction_type,
+            "name_on_card": name_on_card,
+            "last_four_digits": last_four_digits,
+            "expiry_month": expiry_month,
+            "expiry_year": expiry_year,
+            "transaction_amount": transaction_amount,
+            "zip_code": zip_code,
+            "street_address": street_address,
+        }
+
+        bool_value = True
+
+        # Print values for debugging
+        logger.info(f"Name on card: {name_on_card}, Expiry Month: {expiry_month}, Expiry Year: {expiry_year}")
+        logger.info(f"Boolean Value: {bool_value}")
+
+        if bool_value:
+            elavon_response = send_to_elavon_api(auth_token, transaction_id, card_data, transaction_amount, zip_code, street_address)
+
+            print({
+                'statusCode': 200,
+                'body': json.dumps({'elavon_response': elavon_response})
+            })
+
+# Adjust the response as needed here
+            # formatted_response = {
+            #     "details": {
+            #         "authorization_code": auth_code,
+            #         "card_country_of_origin": "124",
+            #         "terminal_id": terminal_id,
+            #         "application_id": application_id,
+            #         "currency": currency_code,
+            #         "agency": agency_name,
+            #         "transaction_type": transaction_type,
+            #         "card_type": "MCRD",
+            #         "transaction_id": elavon_responses["transaction_id"],
+            #         "card_product": "MC",
+            #         "expiry_date": elavon_responses["expiry_month"] + elavon_responses["expiry_year"],
+            #         "token": "10552235387M1116",
+            #         "card_last_four_digits": elavon_responses["last_four_digits"]
+            #     },
+            #     "message": "" 
+            # }
+
+            formatted_response = {
+                "message": "" ,
+                "details": {
+                    "authorization_code": auth_code,
+                    #"card_country_of_origin": "124",
+                    #"terminal_id": terminal_id,
+                    #"application_id": application_id,
+                    #"currency": currency_code,
+                    #"agency": agency_name,
+                    #"transaction_type": transaction_type,
+                    "card_last_four_digits": elavon_responses["last_four_digits"],
+                    "card_type": "MCRD",
+                    "expiry_date": elavon_responses["expiry_month"] + elavon_responses["expiry_year"],
+                    "transaction_id": elavon_responses["transaction_id"],
+                    #"card_product": "MC",
+                    #"token": "10552235387M1116",
+                }
+            }
+
+            # Return the response
+            return formatted_response
+
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"HTTP request error: {e}")
+        return {
+            'statusCode': 500,
+            'Elavon Response': json.dumps({'ElavonResponse': str(elavon_response.json()) if 'elavon_response' in locals() else None}),
+        }
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        return {
+            'statusCode': 500,
+            'Elavon Response': json.dumps({'ElavonResponse': str(elavon_response.json()) if 'elavon_response' in locals() else None}),
+        }
+
+#=========================================
